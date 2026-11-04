@@ -33,6 +33,7 @@ struct MemoryFixture {
     size_t contiguous_limit=0;   /* nonzero: physically contiguous requests above this many bytes fail (a fragmented tablet) */
     unsigned imported=0,imports_live=0;
     unsigned physical_calls=0;size_t physical_bytes=0;   /* NativeAdrenoMaintainPhysicalPages doubles */
+    void (*allocation_hook)(unsigned options,size_t bytes)=nullptr;   /* sees every IOBufferMemoryDescriptor request, refused ones too */
     IOReturn cpu_status=kIOReturnSuccess;
     SegmentMode mode=Contiguous;
     std::vector<IOBufferMemoryDescriptor *> live;
@@ -59,6 +60,7 @@ public:
     bool contiguous=false;
     static IOBufferMemoryDescriptor *inTaskWithPhysicalMask(void *task,unsigned options,size_t bytes,uint64_t mask) {
         if(task!=kernel_task || !(options&kIOMemoryMapperNone))std::abort();
+        if(fixture.allocation_hook)fixture.allocation_hook(options,bytes);
         if(fixture.allocation_fail)return nullptr;
         if(fixture.allocation_fail_count) {--fixture.allocation_fail_count;return nullptr;}
         if(fixture.contiguous_limit && (options&kIOMemoryPhysicallyContiguous) && bytes>fixture.contiguous_limit)return nullptr;

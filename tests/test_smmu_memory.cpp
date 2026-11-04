@@ -50,6 +50,30 @@ int main()
         if(failure==3)CHECK(memory.retireAfterQuiescence()==kIOReturnSuccess);
         CHECK(memory.release()==kIOReturnSuccess && fixture.live.empty() && fixture.metadata.empty());++refusals;
     }
+    /* M10: the coherent-walk publisher orders stores only (no clean); the TTBR1 guard page is zeroed, cleaned, held. */
+    unsigned m10=0;
+    {
+        fixture=MemoryFixture{};
+        NativeAdrenoMemory memory;ArmSmmu4KLiveArena arena;ArmSmmu4KLiveState state{};ArmSmmu4KLiveVisibility visibility,coherent;
+        CHECK(memory.allocate(8*4096,40,true,8*4096)==kIOReturnSuccess);
+        CHECK(NativeAdrenoBindSmmuVisibilityCoherent(&memory,&coherent)==kIOReturnBadArgument && !coherent.publish_table_page);
+        CHECK(NativeAdrenoPrepareSmmuMemory(&memory,32,40,0x1ff000,8192,0,16,&arena,&state,&visibility)==kIOReturnSuccess);
+        CHECK(NativeAdrenoBindSmmuVisibilityCoherent(&memory,&coherent)==kIOReturnSuccess && coherent.cookie==&memory);
+        const unsigned calls=fixture.cache_calls;
+        CHECK(!coherent.publish_table_page(coherent.cookie,arena.mapping,4096) && fixture.cache_calls==calls);
+        CHECK(coherent.publish_table_page(coherent.cookie,arena.mapping+1,4096) && coherent.publish_table_page(coherent.cookie,arena.mapping,8192));
+        CHECK(!visibility.publish_table_page(visibility.cookie,arena.mapping,4096) && fixture.cache_calls==calls+1);
+        CHECK(memory.retireAfterQuiescence()==kIOReturnSuccess && memory.release()==kIOReturnSuccess);++m10;
+        NativeAdrenoMemory guard;
+        CHECK(NativeAdrenoPrepareGuardTable(nullptr,36)==kIOReturnBadArgument);
+        CHECK(NativeAdrenoPrepareGuardTable(&guard,36)==kIOReturnSuccess && guard.bytes()==4096 && guard.deviceReferences()==1);
+        for(unsigned i=0;i<512;++i)CHECK(!static_cast<volatile uint64_t *>(guard.mapping())[i]);
+        CHECK(fixture.cache_calls==calls+3 && guard.spans()[0].physical+4096<=(UINT64_C(1)<<36));
+        CHECK(NativeAdrenoPrepareGuardTable(&guard,36)==kIOReturnBusy);
+        CHECK(guard.retireAfterQuiescence()==kIOReturnSuccess && guard.release()==kIOReturnSuccess);++m10;
+        CHECK(fixture.live.empty() && fixture.metadata.empty());
+    }
+    std::printf("PASS: %u M10 coherent-walk publisher and TTBR1 guard-page controls\n",m10);
     std::printf("PASS: %u native allocator/table-pool bindings and %u capacity/scatter/publication/ownership refusals; no hardware context enabled\n",profiles,refusals);
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */

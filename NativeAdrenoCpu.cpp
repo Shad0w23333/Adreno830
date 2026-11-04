@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoMemory.h"
+#include "NativeAdrenoKopt.h"
 #include <kern/cpu_data.h>
 #include <vm/vm_map.h>
 #include <mach/vm_param.h>
@@ -41,27 +42,33 @@ IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
         (out->sctlr&1) && (out->ttbr1&UINT64_C(0x0000fffffffff000));
     return native?kIOReturnSuccess:kIOReturnUnsupported;
 }
-static IOReturn maintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoCacheOperation op)
-{
-    /* Whole owned pages avoid IVAC corruption of a neighbour's dirty line.
-     * No Apple coherent-I/O shortcut is used for these noncoherent DMA paths.
-     * Pin this CPU while reading its CTR and issuing all cache operations. */
-    if(!mapping || !bytes || (((uintptr_t)mapping|bytes)&4095) ||
-        bytes>UINTPTR_MAX-(uintptr_t)mapping || op>NativeAdrenoInvalidate || op<NativeAdrenoClean)
-        return kIOReturnBadArgument;
-    disable_preemption();
-    uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));
-    size_t line=(size_t)4<<((ctr>>16)&15);
-    if(line>4096) {enable_preemption();return kIOReturnUnsupported;}
-    uintptr_t address=(uintptr_t)mapping,end=address+bytes;
-    __asm__ volatile("dsb sy":::"memory");
-    for(;address<end;address+=line) {
+namespace {
+/* NativeAdrenoMaintainRuns on this CPU. */
+struct CpuRuns {
+    NativeAdrenoCacheOperation op;
+    void pin() {disable_preemption();}
+    void unpin() {enable_preemption();}
+    size_t lineBytes() {uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));return (size_t)4<<((ctr>>16)&15);}
+    void barrier() {__asm__ volatile("dsb sy":::"memory");}
+    void maintain(uintptr_t address) {
         if(op==NativeAdrenoClean)__asm__ volatile("dc cvac, %0"::"r"(address):"memory");
         else if(op==NativeAdrenoCleanInvalidate)__asm__ volatile("dc civac, %0"::"r"(address):"memory");
         else __asm__ volatile("dc ivac, %0"::"r"(address):"memory");
     }
-    __asm__ volatile("dsb sy":::"memory");
-    enable_preemption();return kIOReturnSuccess;
+};
+}
+static IOReturn maintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoCacheOperation op)
+{
+    /* Whole owned pages avoid IVAC corruption of a neighbour's dirty line.
+     * No Apple coherent-I/O shortcut is used for these noncoherent DMA paths.
+     * Pin this CPU while reading its CTR and issuing the cache operations: a run of 64 pages at a time (a 1024 MiB pool was one run, and
+     * so was every surface-sized BO outside the pool: no thread of that core ran until it ended), or with pagani-gpu-kopt bit 3 off
+     * the whole range. */
+    if(!mapping || !bytes || (((uintptr_t)mapping|bytes)&4095) ||
+        bytes>UINTPTR_MAX-(uintptr_t)mapping || op>NativeAdrenoInvalidate || op<NativeAdrenoClean)
+        return kIOReturnBadArgument;
+    CpuRuns runs{op};
+    return NativeAdrenoMaintainRuns((uintptr_t)mapping,bytes,NativeAdrenoKoptOn(NativeAdrenoKoptRuns)?size_t(NativeAdrenoMaintainRunBytes):bytes,runs);
 }
 IOReturn NativeAdrenoMaintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoCacheOperation op)
 {

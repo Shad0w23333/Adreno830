@@ -6,7 +6,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Userspace side of the wire ABI. The transport is injected so the same client
+/* Host-only (never in the kernel archive, ARCHITECTURE 2.2): the qualification client of the ABI tests (tests/test_client.cpp).
+ * Userspace side of the wire ABI. The transport is injected so the same client
  * can drive an IOKit connection later and the kernel dispatch core during host
  * qualification. Records are built and checked here at their exact fixed size;
  * malformed counts are refused before any transport call. The client stores

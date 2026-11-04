@@ -3,20 +3,19 @@
 #include <IOKit/IOLib.h>
 
 /* Derivation, not a guess:
- *   pinned a6xx_gmu.xml  GMU_ALWAYS_ON_COUNTER_L 0x1f888, _H 0x1f889
- *                        (dword offsets, variants A6XX-A7XX)
- *   pinned sm8550.dtsi   gpu@3d00000, gmu@3d6a000
- *   byte offset = (offset << 2) - (gmu_base - gpu_base)
- *               = (0x1f888 << 2) - 0x6a000 = 0x14220
- *   pinned a6xx.xml      CP_ALWAYS_ON_COUNTER 0x0980 (64-bit, A6XX-A7XX)
- *     read as low at 0x0980 and high at 0x0981, as Linux gpu_read64 does. */
+ *   KGSL gen8_reg.h / A830Regs.h  GEN8_GMUCX_AO_COUNTER_LO 0x1F840, _HI 0x1F841 (GPU-space dwords)
+ *   SM8750 DT                     gpu@3d00000, gmu@3d37000 (the gmu window starts 0x37000 bytes into the GPU space)
+ *   byte offset in the gmu window = (dword << 2) - 0x37000 = 0x47100 (low), 0x47104 (high)
+ *   Mesa a6xx.xml A8XX            CP_ALWAYS_ON_COUNTER 0x08E7 (64-bit: low 0x8E7, high 0x8E8)
+ * The read order is KGSL gen8_read_alwayson: high, low, high; when the two high words differ the low word is read again
+ * and paired with the second high word. */
 enum : uint32_t {
-    TimerGmuLow = 0x14220,
-    TimerGmuHigh = 0x14224,
-    TimerCpLow = 0x0980,
-    TimerCpHigh = 0x0981,
-    TimerRetries = 8
+    TimerGmuLow=0x47100,
+    TimerGmuHigh=0x47104,
+    TimerCpLow=0x08E7,
+    TimerCpHigh=0x08E8,
 };
+static_assert(TimerGmuLow==(0x1F840u<<2)-0x37000u && TimerGmuHigh==TimerGmuLow+4,"GMUCX AO counter in the gmu window");
 uint32_t NativeAdrenoTimer::gmuLowOffset(){return TimerGmuLow;}
 uint32_t NativeAdrenoTimer::gmuHighOffset(){return TimerGmuHigh;}
 uint32_t NativeAdrenoTimer::cpLowRegister(){return TimerCpLow;}
@@ -41,15 +40,11 @@ IOReturn NativeAdrenoTimer::read(uint64_t *ticks) const
     if(!attached_)return kIOReturnNotReady;
     const uint32_t low=source_==NativeAdrenoTimeGmu?TimerGmuLow:TimerCpLow;
     const uint32_t high=source_==NativeAdrenoTimeGmu?TimerGmuHigh:TimerCpHigh;
-    for(unsigned attempt=0;attempt<TimerRetries;++attempt) {
-        uint32_t first=0,low_word=0,second=0;
-        if(io_.read32(io_.cookie,high,&first) ||
-            io_.read32(io_.cookie,low,&low_word) ||
-            io_.read32(io_.cookie,high,&second))return kIOReturnIOError;
-        if(first==second) {
-            *ticks=(uint64_t(first)<<32)|low_word;
-            return kIOReturnSuccess;
-        }
-    }
-    return kIOReturnTimeout;
+    uint32_t first=0,low_word=0,second=0;
+    if(io_.read32(io_.cookie,high,&first) || io_.read32(io_.cookie,low,&low_word) || io_.read32(io_.cookie,high,&second))
+        return kIOReturnIOError;
+    /* The low word wrapped between the two high reads: it belongs to the second high word only if read after it. */
+    if(first!=second && io_.read32(io_.cookie,low,&low_word))return kIOReturnIOError;
+    *ticks=(uint64_t(second)<<32)|low_word;
+    return kIOReturnSuccess;
 }

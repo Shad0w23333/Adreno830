@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
-/* Userspace client and kernel dispatch over software SMMU/CP peers. */
+/* Userspace client and kernel dispatch over software SMMU/CP peers.
+ * host-test: NativeAdrenoMemory.cpp NativeAdrenoSmmuMemory.cpp NativeAdrenoVm.cpp NativeAdrenoRing.cpp NativeAdrenoSubmit.cpp NativeAdrenoUserClient.cpp NativeAdrenoTimer.cpp NativeAdrenoClient.cpp */
 #include "XnuMemoryFixture.h"
 #include "NativeAdrenoClient.h"
 #include "NativeAdrenoUserClient.h"
@@ -33,7 +34,8 @@ static int mread64(void *c,size_t at,uint64_t *v)
 {CHECK(c==&mf && at%8==0 && at<=SMMU_BYTES-8);if(mevent())return 1;std::memcpy(v,mmio+at/4,8);return 0;}
 static int mwrite32(void *c,size_t at,uint32_t v)
 {CHECK(c==&mf && at%4==0 && at<=SMMU_BYTES-4);int f=mevent();if(f && !mf.after)return 1;mmio[at/4]=v;return f;}
-static int mwrite64(void *c,size_t at,uint64_t v){(void)c;(void)at;(void)v;CHECK(0);return 1;}
+static int mwrite64(void *c,size_t at,uint64_t v)
+{CHECK(c==&mf && at%8==0 && at<=SMMU_BYTES-8);int f=mevent();if(f && !mf.after)return 1;std::memcpy(mmio+at/4,&v,8);return f;}
 static int mbarrier(void *c){CHECK(c==&mf);return mevent();}
 struct CpPeer {
     std::vector<uint32_t> regs,writes;
@@ -48,9 +50,9 @@ static int cread(void *c,uint32_t reg,uint32_t *v)
 {CHECK(c==&cp && v && reg<cp.regs.size());*v=cp.regs[reg];return 0;}
 static int cbarrier(void *c){CHECK(c==&cp);++cp.barriers;return 0;}
 static int cpublish(void *c,const volatile uint32_t *w,size_t bytes)
-{CHECK(c==&cp && w && bytes==32768);++cp.publish;return cp.publish==cp.fail_publish;}
+{CHECK(c==&cp && w && bytes && bytes<=32768);++cp.publish;return cp.publish==cp.fail_publish;}
 static int cacquire(void *c,volatile uint32_t *w,size_t bytes)
-{CHECK(c==&cp && w && bytes==4096);++cp.acquire;return 0;}
+{CHECK(c==&cp && w && bytes>=8 && bytes<=4096);++cp.acquire;return 0;}
 static uint64_t cnow(void *c){CHECK(c==&cp);return clock_us;}
 static int cidle(void *c){CHECK(c==&cp);clock_us+=1000;return 0;}
 struct Path {
@@ -64,7 +66,7 @@ struct Path {
     NativeAdrenoUserClient client;
 };
 static uint32_t ringmem[8192],fencemem[1024];
-static NativeAdrenoRingIo ringio{&cp,cwrite,cread,cbarrier,nullptr,nullptr};
+static NativeAdrenoRingIo ringio{&cp,cwrite,cread,cbarrier,nullptr,nullptr,nullptr};
 static NativeAdrenoRingCache ringcache{&cp,cpublish,cacquire};
 static NativeAdrenoRingClock ringclock{&cp,cnow,cidle};
 static int timeread(void *c,uint32_t address,uint32_t *value)
@@ -99,10 +101,11 @@ static int exposed(Path &p)
     if(ArmSmmu4KAttachStreams(&smmuio,&streams,routes,2,2,&context,&route_result))return kIOReturnBadArgument;
     NativeAdrenoVmRegion lower={&p.tables,&p.arena,&p.state};
     if(p.vm.attach(&smmuio,&context,&streams,&lower,nullptr,32,1000))return kIOReturnBadArgument;
+    p.vm.setFenceSource(&fencemem[1]);
     if(p.ring.attach(&ringio,&ringcache,ringmem,sizeof(ringmem),0x100000,fencemem,sizeof(fencemem),0x108000))
         return kIOReturnBadArgument;
     if(p.execbuf.attach(&p.vm,&p.ring))return kIOReturnBadArgument;
-    return p.client.open(NativeAdrenoAbiVersion,&p.vm,&p.execbuf,&p.ring,32,40);
+    return p.client.open(NativeAdrenoAbiVersion,&p.vm,&p.execbuf,&p.ring,32,36);
 }
 
 /* The transport is exactly the kernel dispatch entry, so a successful
@@ -140,7 +143,7 @@ int main()
         CHECK(client.open(&t)==kIOReturnSuccess && client.isOpen());
         CHECK(client.open(&t)==kIOReturnBusy);
         NativeAdrenoAbiParams info{};
-        CHECK(client.query(&info)==kIOReturnSuccess && info.input_bits==32 && info.output_bits==40);
+        CHECK(client.query(&info)==kIOReturnSuccess && info.input_bits==32 && info.output_bits==36);
         uint64_t handle=0,mapped=0;
         CHECK(client.allocBo(8192,12,true,&handle)==kIOReturnSuccess && handle);
         uint32_t token=0;
@@ -161,11 +164,14 @@ int main()
         CHECK(client.submit(&buffer,1,0,0,&fence)==kIOReturnSuccess && fence==1);
         fencemem[1]=1;
         CHECK(client.waitFence(fence,0)==kIOReturnSuccess);
+        /* An earlier fence is satisfied by ring order: no CPU wait (ARCHITECTURE 4.13.3); a fence never issued is refused. */
         CHECK(client.submit(&buffer,1,fence,0,&fence)==kIOReturnSuccess && fence==2);
+        uint64_t refused=0;
+        CHECK(client.submit(&buffer,1,9,0,&refused)==kIOReturnBadArgument && !refused);
         CHECK(client.waitFence(fence,0)==kIOReturnTimeout);
         fencemem[1]=2;
         CHECK(client.waitFence(fence,UINT64_C(1000000))==kIOReturnSuccess);
-        cp.regs[0x0980]=0x42;cp.regs[0x0981]=7;
+        cp.regs[NativeAdrenoTimer::cpLowRegister()]=0x42;cp.regs[NativeAdrenoTimer::cpHighRegister()]=7;
         uint64_t ticks=0;
         CHECK(client.timestamp(&ticks)==kIOReturnSuccess && ticks==((UINT64_C(7)<<32)|0x42));
         counters.noteFault();
@@ -247,7 +253,8 @@ int main()
         CHECK(wire.calls==calls);
         CHECK(client.close()==kIOReturnSuccess);
     }
-    std::printf("PASS: 1 userspace-to-kernel round trip including CPU mapping leases and queue lifecycle, 1 version mismatch, 1 altered-size rejection and 8 client-side refusals over software SMMU/CP peers\n");
+    std::printf("PASS: 1 userspace-to-kernel round trip including CPU mapping leases, queue lifecycle and a wait_fence validated "
+        "without CPU wait, 1 version mismatch, 1 altered-size rejection and 8 client-side refusals over software SMMU/CP peers\n");
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */
 /* Host double: the page attribute change of user BOs has no host equivalent (no host page is touched). */
